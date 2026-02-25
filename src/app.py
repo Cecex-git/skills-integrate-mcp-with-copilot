@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import json
+import secrets
+from pydantic import BaseModel
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,21 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    role: str
+
+
+teachers_file = Path(__file__).parent / "teachers.json"
+teacher_credentials = {}
+if teachers_file.exists():
+    with open(teachers_file, "r", encoding="utf-8") as f:
+        teacher_credentials = json.load(f)
+
+active_sessions = {}
 
 # In-memory activity database
 activities = {
@@ -78,6 +96,33 @@ activities = {
 }
 
 
+def parse_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid auth scheme")
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    return token
+
+
+def get_current_user_role(authorization: str | None = Header(default=None)) -> str:
+    token = parse_bearer_token(authorization)
+    session = active_sessions.get(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return session["role"]
+
+
+def require_teacher(role: str = Depends(get_current_user_role)) -> str:
+    if role != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return role
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,8 +133,49 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    role = payload.role.strip().lower()
+    username = payload.username.strip().lower()
+
+    if role not in {"student", "teacher"}:
+        raise HTTPException(status_code=400, detail="Role must be 'student' or 'teacher'")
+
+    if role == "teacher":
+        expected_password = teacher_credentials.get(username)
+        if expected_password is None or expected_password != payload.password:
+            raise HTTPException(status_code=401, detail="Invalid teacher credentials")
+    else:
+        if not username.endswith("@mergington.edu"):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid student credentials. Use a @mergington.edu email"
+            )
+
+    token = secrets.token_urlsafe(24)
+    active_sessions[token] = {"username": username, "role": role}
+    return {"token": token, "role": role, "username": username}
+
+
+@app.post("/auth/logout")
+def logout(authorization: str | None = Header(default=None)):
+    token = parse_bearer_token(authorization)
+    if token not in active_sessions:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    del active_sessions[token]
+    return {"message": "Logged out"}
+
+
+@app.get("/auth/me")
+def auth_me(role: str = Depends(get_current_user_role), authorization: str | None = Header(default=None)):
+    token = parse_bearer_token(authorization)
+    session = active_sessions[token]
+    return {"username": session["username"], "role": role}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +197,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
